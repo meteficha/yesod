@@ -16,55 +16,55 @@ module Yesod.Persist.Session.Internal.Backend
   , forceInvalidate
   ) where
 
-import Control.Monad (guard, void, when)
+import Control.Monad (guard, when)
+import Control.Monad.IO.Class (MonadIO(..))
 import Data.ByteString (ByteString)
 import Data.Default (def)
 import Data.Maybe (isJust)
-import Data.Pool (Pool)
 import Data.Text (Text)
 import Data.Time (getCurrentTime)
 import Data.Typeable (Typeable)
 import Web.Cookie (parseCookies, SetCookie(..))
-import Yesod.Core
-import Yesod.Core.Types (SaveSession)
+import Web.PathPieces (fromPathPiece)
+import Yesod.Core (MonadHandler)
+import Yesod.Core.Handler (setSessionBS)
+import Yesod.Core.Types (Header(AddCookie), SaveSession, SessionBackend(..), SessionMap)
 
 import qualified Crypto.Nonce as N
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.Map as M
 import qualified Data.Text.Encoding as TE
-import qualified Database.Persist as P
-import qualified Database.Persist.Sql as P
 import qualified Network.Wai as W
 
-import Yesod.Persist.Session.Internal.Entities
 import Yesod.Persist.Session.Internal.Types
 
 -- TODO: expiration
+
+-- TODO: do not create empty sessions
 
 -- | The server-side session backend needs to maintain some state
 -- in order to work:
 --
 --   * A nonce generator for the session IDs.
 --
---   * A SQL connection pool for saving and loading the sessions.
+--   * The storage backend.
 --
 -- Create a new 'State' using 'createState'.
-data State =
+data State s =
   State
     { generator :: !N.Generator
-    , connPool  :: !(Pool P.SqlBackend)
+    , storage   :: !s
     } deriving (Typeable)
 
 
 -- | Create a new 'State' for the server-side session backend
--- using the given pool of SQL connections.  You may use the same
--- pool as your application.
-createState :: MonadIO m => Pool P.SqlBackend -> m State
-createState pool = State <$> N.new <*> return pool
+-- using the given storage backend.
+createState :: MonadIO m => s -> m (State s)
+createState storage = State <$> N.new <*> return storage
 
 
 -- | Construct the server-side session backend from the given state.
-backend :: State -> SessionBackend
+backend :: Storage s => State s -> SessionBackend
 backend state =
   SessionBackend {
     sbLoadSession = loadSession state "JSESSIONID" -- LOL :)
@@ -74,48 +74,52 @@ backend state =
 -- | Load the session map from the DB from the ID on the request.
 -- Also provides a function to update the session when sending
 -- the response.
-loadSession :: State -> ByteString -> W.Request -> IO (SessionMap, SaveSession)
+loadSession :: forall s. Storage s => State s -> ByteString -> W.Request -> IO (SessionMap, SaveSession)
 loadSession state cookieName = load
   where
-    runDB :: P.SqlPersistT IO a -> IO a
-    runDB act = P.runSqlPool act (connPool state)
+    runDB :: TransactionM s a -> IO a
+    runDB = runTransactionM (storage state)
 
     load :: W.Request -> IO (SessionMap, SaveSession)
     load req = do
       -- Find 'SessionId' (if any) and load it from DB (if present).
       let maybeInputId = findSessionId cookieName req
-      maybeInput <- maybe (return Nothing) (runDB . P.get . psKey) maybeInputId
+      maybeInput <- maybe (return Nothing) (runDB . getSession (storage state)) maybeInputId
       let inputSessionMap = maybe M.empty toSessionMap maybeInput
       return (inputSessionMap, save maybeInput)
 
-    save :: Maybe PersistentSession -> SaveSession
+    save :: Maybe Session -> SaveSession
     save maybeInput wholeOutputSessionMap =
       runDB $ do
         let decomposedSessionMap = decomposeSession wholeOutputSessionMap
-        newMaybeInput <- invalidateIfNeeded maybeInput decomposedSessionMap
+        newMaybeInput <- invalidateIfNeeded state maybeInput decomposedSessionMap
         key <- saveSessionOnDb state newMaybeInput decomposedSessionMap
         return [createCookie cookieName key]
 
 
 -- | Invalidates an old session ID if needed.  Returns the
--- 'PersistentSession' that should be replaced when saving
--- the session, if any.
+-- 'Session' that should be replaced when saving the session, if any.
 --
 -- Currently we invalidate whenever the auth ID has changed
 -- (login, logout, different user) in order to prevent session
 -- fixation attacks.  We also invalidate when asked to via
 -- 'forceInvalidate'.
-invalidateIfNeeded :: Maybe PersistentSession -> DecomposedSession -> P.SqlPersistT IO (Maybe PersistentSession)
-invalidateIfNeeded maybeInput DecomposedSession {..} = do
+invalidateIfNeeded
+  :: Storage s
+  => State s
+  -> Maybe Session
+  -> DecomposedSession
+  -> TransactionM s (Maybe Session)
+invalidateIfNeeded state maybeInput DecomposedSession {..} = do
   -- Decide which action to take.
   -- "invalidateOthers implies invalidateCurrent" should be true below.
-  let inputAuthId       = persistentSessionAuthId =<< maybeInput
+  let inputAuthId       = sessionAuthId =<< maybeInput
       invalidateCurrent = dsForceInvalidate /= DoNotForceInvalidate || inputAuthId /= dsAuthId
       invalidateOthers  = dsForceInvalidate == AllSessionIdsOfLoggedUser && isJust dsAuthId
       whenMaybe b m f   = when b $ maybe (return ()) f m
   -- Delete current and others, as requested.
-  whenMaybe invalidateCurrent maybeInput $ P.delete . psKey . persistentSessionKey
-  whenMaybe invalidateOthers  dsAuthId   $ \a -> P.deleteWhere [PersistentSessionAuthId P.==. Just a]
+  whenMaybe invalidateCurrent maybeInput $ deleteSession (storage state) . sessionKey
+  whenMaybe invalidateOthers  dsAuthId   $ deleteAllSessionsOfAuthId (storage state)
   -- Remember the input only if not invalidated.
   return $ guard (not invalidateCurrent) >> maybeInput
 
@@ -123,9 +127,9 @@ invalidateIfNeeded maybeInput DecomposedSession {..} = do
 -- | A 'SessionMap' with its 'authKey' taken apart.
 data DecomposedSession =
   DecomposedSession
-    { dsAuthId          :: !(Maybe ByteStringJ)
+    { dsAuthId          :: !(Maybe ByteString)
     , dsForceInvalidate :: !ForceInvalidate
-    , dsSessionMap      :: !SessionMapJ
+    , dsSessionMap      :: !SessionMap
     } deriving (Show, Typeable)
 
 
@@ -135,34 +139,35 @@ decomposeSession sm1 =
   let (authId, sm2) = M.updateLookupWithKey (\_ _ -> Nothing) authKey            sm1
       (force,  sm3) = M.updateLookupWithKey (\_ _ -> Nothing) forceInvalidateKey sm2
   in DecomposedSession
-       { dsAuthId          = B <$> authId
+       { dsAuthId          = authId
        , dsForceInvalidate = maybe DoNotForceInvalidate (read . B8.unpack) force
-       , dsSessionMap      = M sm3 }
+       , dsSessionMap      = sm3 }
 
 
 -- | Save a session on the database.  If an old session is
 -- supplied, it is replaced, otherwise a new session is
 -- generated.
 saveSessionOnDb
-  :: State
-  -> Maybe PersistentSession     -- ^ The old session, if any.
-  -> DecomposedSession           -- ^ The session data to be saved.
-  -> P.SqlPersistT IO SessionId  -- ^ The ID of the saved session.
+  :: Storage s
+  => State s
+  -> Maybe Session            -- ^ The old session, if any.
+  -> DecomposedSession        -- ^ The session data to be saved.
+  -> TransactionM s SessionId -- ^ The ID of the saved session.
 saveSessionOnDb state maybeInput DecomposedSession {..} = do
   -- Generate properties if needed or take them from previous
   -- saved session.
   (saveToDb, key, createdAt) <-
     case maybeInput of
       Nothing -> liftIO $
-        (,,) <$> return (void . P.insert)
+        (,,) <$> return (insertSession $ storage state)
              <*> generateSessionId (generator state)
              <*> getCurrentTime
-      Just PersistentSession {..} ->
-        return ( P.replace (psKey persistentSessionKey)
-               , persistentSessionKey
-               , persistentSessionCreatedAt)
+      Just Session {..} ->
+        return ( replaceSession (storage state)
+               , sessionKey
+               , sessionCreatedAt)
   -- Save to the database.
-  saveToDb $ PersistentSession key dsAuthId dsSessionMap createdAt
+  saveToDb $ Session key dsAuthId dsSessionMap createdAt
   return key
 
 
@@ -200,11 +205,10 @@ findSessionId cookieName req = do
   fromPathPiece (TE.decodeUtf8 raw)
 
 
--- | Create a 'SessionMap' from a 'PersistentSession'.
-toSessionMap :: PersistentSession -> SessionMap
-toSessionMap PersistentSession {..} =
-  maybe id (\(B v) -> M.insert authKey v) persistentSessionAuthId $ -- Insert auth key (if any).
-  unM persistentSessionSession                                      -- Remove newtype layer.
+-- | Create a 'SessionMap' from a 'Session'.
+toSessionMap :: Session -> SessionMap
+toSessionMap Session {..} =
+  maybe id (M.insert authKey) sessionAuthId sessionData
 
 
 -- | The session key used by @yesod-auth@ without depending on it.

@@ -36,17 +36,19 @@ library
   exposed-modules:
     Yesod.Persist.Session
     Yesod.Persist.Session.Internal.Backend
-    Yesod.Persist.Session.Internal.Entities
+    Yesod.Persist.Session.Internal.Sql
     Yesod.Persist.Session.Internal.Types
   extensions:
     DeriveDataTypeable
     EmptyDataDecls
+    FlexibleContexts
     FlexibleInstances
     GADTs
     GeneralizedNewtypeDeriving
     OverloadedStrings
     QuasiQuotes
     RecordWildCards
+    ScopedTypeVariables
     TemplateHaskell
     TypeFamilies
   ghc-options:     -Wall

@@ -88,3 +88,44 @@ However, there are some disadvantages to client-side sessions:
 
 If you're concerned about any of the points above, you've come to
 the right package!
+
+
+## Comparision to other packages
+
+At the time of writing (2015-05-22), these are the session
+packages that do not use either `clientsession` or
+`serversession`:
+
+  * `mysnapsession` (via `Memory` module, also supports
+    `clientsession` mode): Server-side sessions.  Works for
+    `snap`.  Weak session ID generation.  Vulnerable to session
+    fixation attacks.  Cannot invalidate other sessions.
+
+  * `salvia-sessions`: Server-side sessions.  Works only for
+    `salvia`.  No built-in support for DB-backed sessions, only
+    memory-backed ones.  Weak session ID generation.  Vulnerable
+    to session fixation attacks.  Cannot invalidate other
+    sessions.
+
+  * `simple-session`: Client-side sessions.  Works for `simple`
+    framework.  No encryption.  Authentication vulnerable to
+    timing attacks.
+
+  * `Spock` (formely `scotty-session`): Server-side sessions.
+    Works for `Spock` (code is not packaged separately).  Only
+    supports memory-backed sessions persisted on a file.  Weak
+    session ID generation.  Vulnerable to session fixation
+    attacks.  Cannot invalidate other sessions.
+
+  * `wai-session`: Server-side sessions.  Works for `wai`
+    applications.  Weak session ID generation.  Vulnerable to
+    session fixation.  Cannot invalidate other sessions.
+    Out-of-the-box support for TokyoCabinet only.
+
+  * `yesod-session-redis`: Server-side sessions.  Works for
+    Yesod and Redis.  Weak session ID generation via `random`.
+    Vulnerable to session fixation.  Cannot invalidate other
+    sessions.
+
+We apologize in advance if any information above is incorrect.
+Please contact us about any errors.

@@ -1,13 +1,17 @@
 module Yesod.Persist.Session.Internal.Types
   ( SessionId(..)
   , generateSessionId
+  , Session(..)
+  , Storage(..)
   , ByteStringJ(..)
   , SessionMapJ(..)
   ) where
 
 import Control.Monad ((>=>), guard, mzero)
+import Control.Monad.IO.Class (MonadIO)
 import Data.ByteString (ByteString)
 import Data.Text (Text)
+import Data.Time (UTCTime)
 import Data.Typeable (Typeable)
 import Database.Persist (PersistField(..))
 import Database.Persist.Sql (PersistFieldSql(..))
@@ -24,8 +28,18 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 
 
+----------------------------------------------------------------------
+
+
 -- | The ID of a session.  Always 18 bytes base64url-encoded as
 -- 24 characters.
+--
+-- Implementation notes:
+--
+--   * Use 'fromPathPiece' for parsing untrusted input.
+--
+--   * Use 'generateSessionId' for securely generating new
+--   session IDs.
 newtype SessionId = S { unS :: Text }
   deriving (Eq, Ord, Show, Read, Typeable)
 
@@ -65,6 +79,53 @@ generateSessionId :: N.Generator -> IO SessionId
 generateSessionId = fmap S . N.nonce128urlT
 
 
+----------------------------------------------------------------------
+
+
+-- | Representation of a saved session.
+data Session =
+  Session
+    { sessionKey :: SessionId
+      -- ^ Session ID, primary key.
+    , sessionAuthId :: Maybe ByteString
+      -- ^ Value of "_ID" session key, separate from the rest.
+    , sessionData :: SessionMap
+      -- ^ Rest of the session data.
+    , sessionCreatedAt :: UTCTime
+      -- ^ When this session was created.
+    } deriving (Eq, Ord, Show, Typeable)
+
+
+----------------------------------------------------------------------
+
+
+-- | A storage backend for server-side sessions.
+class MonadIO (TransactionM s) => Storage s where
+  -- | Monad where transactions happen for this backend.
+  -- We do not require transactions to be ACID.
+  type TransactionM s :: * -> *
+
+  -- | Run a transaction on the IO monad.
+  runTransactionM :: s -> TransactionM s a -> IO a
+
+  -- | Get the session for the given session ID.
+  getSession :: s -> SessionId -> TransactionM s (Maybe Session)
+
+  -- | Delete the session with given session ID.
+  deleteSession :: s -> SessionId -> TransactionM s ()
+
+  -- | Delete all sessions of the given auth ID.
+  deleteAllSessionsOfAuthId :: s -> ByteString -> TransactionM s ()
+
+  -- | Insert a new session.
+  insertSession :: s -> Session -> TransactionM s ()
+
+  -- | Replace the contents of a session.
+  replaceSession :: s -> Session -> TransactionM s ()
+
+
+----------------------------------------------------------------------
+
 
 -- | Newtype of a 'ByteString' with JSON support via base64url.
 newtype ByteStringJ = B { unB :: ByteString }
@@ -86,6 +147,9 @@ instance A.FromJSON ByteStringJ where
 
 instance A.ToJSON ByteStringJ where
   toJSON = A.String . TE.decodeUtf8 . B64URL.encode . unB
+
+
+----------------------------------------------------------------------
 
 
 -- | Newtype of a 'SessionMap' that serializes as a JSON on
