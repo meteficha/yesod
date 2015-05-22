@@ -1,13 +1,16 @@
+-- | Server-side session backend.
+--
+-- This module is meant to be imported qualified:
+--
+-- @
+-- import qualified Yesod.Persist.Session as Session
+-- @
+--
+-- TODO: Usage
 module Yesod.Persist.Session
-  (
+  ( backend
+  , createState
+  , State
   ) where
 
-import Data.Typeable (Typeable)
-
-import qualified Crypto.Nonce as N
-
--- | TODO
-data PersistentSessionState =
-  PersistentSessionState {
-    generator :: !N.Generator
-  } deriving (Typeable)
+import Yesod.Persist.Session.Internal.Backend

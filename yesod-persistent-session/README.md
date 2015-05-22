@@ -26,6 +26,13 @@ If you wish to use a different authentication mechanism and still
 enjoy the advantages above, just use the same `_ID` session key.
 
 
+## Limitations
+
+  * As we have to fix upfront which persistent backend we'll use,
+    currently we support SQL backends only, such as
+    `persistent-postgresql`.
+
+
 ## Background
 
 Yesod has always support client-side sessions via the

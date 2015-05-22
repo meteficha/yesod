@@ -21,15 +21,21 @@ library
     , base64-bytestring         == 1.0.*
     , bytestring
     , containers
+    , cookie                    >= 0.4
+    , data-default
     , nonce                     == 1.0.*
     , path-pieces
     , persistent                == 2.1.*
     , persistent-template       == 2.1.*
+    , resource-pool
     , text
     , time
+    , transformers
+    , wai
     , yesod-core                == 1.4.*
   exposed-modules:
     Yesod.Persist.Session
+    Yesod.Persist.Session.Internal.Backend
     Yesod.Persist.Session.Internal.Entities
     Yesod.Persist.Session.Internal.Types
   extensions:
@@ -40,6 +46,7 @@ library
     GeneralizedNewtypeDeriving
     OverloadedStrings
     QuasiQuotes
+    RecordWildCards
     TemplateHaskell
     TypeFamilies
   ghc-options:     -Wall

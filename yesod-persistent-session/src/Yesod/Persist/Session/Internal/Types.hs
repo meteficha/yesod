@@ -1,5 +1,6 @@
 module Yesod.Persist.Session.Internal.Types
   ( SessionId(..)
+  , generateSessionId
   , ByteStringJ(..)
   , SessionMapJ(..)
   ) where
@@ -13,6 +14,7 @@ import Database.Persist.Sql (PersistFieldSql(..))
 import Web.PathPieces (PathPiece(..))
 import Yesod.Core (SessionMap)
 
+import qualified Crypto.Nonce as N
 import qualified Data.Aeson as A
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Base64.URL as B64URL
@@ -22,8 +24,8 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 
 
--- | The ID of a session.  Always 16 bytes base64url-encoded as 20
--- characters.
+-- | The ID of a session.  Always 18 bytes base64url-encoded as
+-- 24 characters.
 newtype SessionId = S { unS :: Text }
   deriving (Eq, Ord, Show, Read, Typeable)
 
@@ -48,13 +50,19 @@ instance A.ToJSON SessionId where
 
 
 -- | (Internal) Check that the given text is a base64url-encoded
--- representation of 16 bytes.
+-- representation of 18 bytes.
 checkSessionId :: Text -> Maybe SessionId
 checkSessionId text = do
+  guard (T.length text == 24)
   let bs = TE.encodeUtf8 text
   decoded <- either (const Nothing) Just $ B64URL.decode bs
-  guard (B.length decoded == 16)
+  guard (B.length decoded == 18)
   return $ S $ T.toLower text
+
+
+-- | Securely generate a new SessionId.
+generateSessionId :: N.Generator -> IO SessionId
+generateSessionId = fmap S . N.nonce128urlT
 
 
 
