@@ -11,12 +11,15 @@ module Yesod.Persist.Session.Internal.Backend
   , findSessionId
   , toSessionMap
   , authKey
+  , forceInvalidateKey
+  , ForceInvalidate(..)
+  , forceInvalidate
   ) where
 
-import Control.Arrow ((***))
-import Control.Monad (guard, void)
+import Control.Monad (guard, void, when)
 import Data.ByteString (ByteString)
 import Data.Default (def)
+import Data.Maybe (isJust)
 import Data.Pool (Pool)
 import Data.Text (Text)
 import Data.Time (getCurrentTime)
@@ -26,6 +29,7 @@ import Yesod.Core
 import Yesod.Core.Types (SaveSession)
 
 import qualified Crypto.Nonce as N
+import qualified Data.ByteString.Char8 as B8
 import qualified Data.Map as M
 import qualified Data.Text.Encoding as TE
 import qualified Database.Persist as P
@@ -98,27 +102,42 @@ loadSession state cookieName = load
 -- the session, if any.
 --
 -- Currently we invalidate whenever the auth ID has changed
--- (login, logout, different user) in order to prevent
--- session fixation attacks.
+-- (login, logout, different user) in order to prevent session
+-- fixation attacks.  We also invalidate when asked to via
+-- 'forceInvalidate'.
 invalidateIfNeeded :: Maybe PersistentSession -> DecomposedSession -> P.SqlPersistT IO (Maybe PersistentSession)
-invalidateIfNeeded maybeInput (outputAuthId, _) = do
-  let inputAuthId  = persistentSessionAuthId =<< maybeInput
-      invalidate = inputAuthId /= outputAuthId
-      toDelete      = guard (not invalidate) >> maybeInput
-      newMaybeInput = guard      invalidate  >> maybeInput
-  maybe (return ()) (P.delete . psKey . persistentSessionKey) toDelete -- Delete, if needed.
-  return newMaybeInput
+invalidateIfNeeded maybeInput DecomposedSession {..} = do
+  -- Decide which action to take.
+  -- "invalidateOthers implies invalidateCurrent" should be true below.
+  let inputAuthId       = persistentSessionAuthId =<< maybeInput
+      invalidateCurrent = dsForceInvalidate /= DoNotForceInvalidate || inputAuthId /= dsAuthId
+      invalidateOthers  = dsForceInvalidate == AllSessionIdsOfLoggedUser && isJust dsAuthId
+      whenMaybe b m f   = when b $ maybe (return ()) f m
+  -- Delete current and others, as requested.
+  whenMaybe invalidateCurrent maybeInput $ P.delete . psKey . persistentSessionKey
+  whenMaybe invalidateOthers  dsAuthId   $ \a -> P.deleteWhere [PersistentSessionAuthId P.==. Just a]
+  -- Remember the input only if not invalidated.
+  return $ guard (not invalidateCurrent) >> maybeInput
 
 
 -- | A 'SessionMap' with its 'authKey' taken apart.
-type DecomposedSession = (Maybe ByteStringJ, SessionMapJ)
+data DecomposedSession =
+  DecomposedSession
+    { dsAuthId          :: !(Maybe ByteStringJ)
+    , dsForceInvalidate :: !ForceInvalidate
+    , dsSessionMap      :: !SessionMapJ
+    } deriving (Show, Typeable)
 
 
 -- | Decompose a session (see 'DecomposedSession').
 decomposeSession :: SessionMap -> DecomposedSession
-decomposeSession =
-  (fmap B *** M) .
-  M.updateLookupWithKey (\_ _ -> Nothing) authKey
+decomposeSession sm1 =
+  let (authId, sm2) = M.updateLookupWithKey (\_ _ -> Nothing) authKey            sm1
+      (force,  sm3) = M.updateLookupWithKey (\_ _ -> Nothing) forceInvalidateKey sm2
+  in DecomposedSession
+       { dsAuthId          = B <$> authId
+       , dsForceInvalidate = maybe DoNotForceInvalidate (read . B8.unpack) force
+       , dsSessionMap      = M sm3 }
 
 
 -- | Save a session on the database.  If an old session is
@@ -129,7 +148,7 @@ saveSessionOnDb
   -> Maybe PersistentSession     -- ^ The old session, if any.
   -> DecomposedSession           -- ^ The session data to be saved.
   -> P.SqlPersistT IO SessionId  -- ^ The ID of the saved session.
-saveSessionOnDb state maybeInput (outputAuthId, outputSessionMap) = do
+saveSessionOnDb state maybeInput DecomposedSession {..} = do
   -- Generate properties if needed or take them from previous
   -- saved session.
   (saveToDb, key, createdAt) <-
@@ -143,7 +162,7 @@ saveSessionOnDb state maybeInput (outputAuthId, outputSessionMap) = do
                , persistentSessionKey
                , persistentSessionCreatedAt)
   -- Save to the database.
-  saveToDb $ PersistentSession key outputAuthId outputSessionMap createdAt
+  saveToDb $ PersistentSession key dsAuthId dsSessionMap createdAt
   return key
 
 
@@ -152,11 +171,11 @@ createCookie :: ByteString -> SessionId -> Header
 createCookie cookieName key =
   -- Generate a cookie with the final session ID.
   AddCookie def
-    { setCookieName = cookieName
-    , setCookieValue = TE.encodeUtf8 $ unS key
-    , setCookiePath = Just "/"
-    , setCookieExpires = Just undefined
-    , setCookieDomain = Nothing
+    { setCookieName     = cookieName
+    , setCookieValue    = TE.encodeUtf8 $ unS key
+    , setCookiePath     = Just "/"
+    , setCookieExpires  = Just undefined
+    , setCookieDomain   = Nothing
     , setCookieHttpOnly = True
     }
 
@@ -181,7 +200,7 @@ findSessionId cookieName req = do
   fromPathPiece (TE.decodeUtf8 raw)
 
 
--- | Creates a 'SessionMap' from a 'PersistentSession'.
+-- | Create a 'SessionMap' from a 'PersistentSession'.
 toSessionMap :: PersistentSession -> SessionMap
 toSessionMap PersistentSession {..} =
   maybe id (\(B v) -> M.insert authKey v) persistentSessionAuthId $ -- Insert auth key (if any).
@@ -191,3 +210,53 @@ toSessionMap PersistentSession {..} =
 -- | The session key used by @yesod-auth@ without depending on it.
 authKey :: Text
 authKey = "_ID"
+
+
+-- | The session key used to signal that the session ID should be
+-- invalidated.
+forceInvalidateKey :: Text
+forceInvalidateKey = "yesod-persistent-session-force-invalidate"
+
+
+-- | Which session IDs should be invalidated.
+data ForceInvalidate =
+    CurrentSessionId
+    -- ^ Invalidate the current session ID.  The current session
+    -- ID is automatically invalidated on @yesod-auth@ login and
+    -- logout.
+  | AllSessionIdsOfLoggedUser
+    -- ^ Invalidate all session IDs beloging to the currently
+    -- logged in user.  Only the current session ID will be
+    -- renewed (the only one for which a cookie can be set).
+    --
+    -- This is useful, for example, if the user asks to change
+    -- their password.  It's also useful to provide a button to
+    -- clear all other sessions.
+    --
+    -- If the user is not logged in, this option behaves exactly
+    -- as 'CurrentSessionId' (i.e., it /does not/ invalidate the
+    -- sessions of all logged out users).
+    --
+    -- Note that, for the purposes of
+    -- 'AllSessionIdsOfLoggedUser', we consider \"logged user\"
+    -- the one that is logged in at the *end* of the handler
+    -- processing.  For example, if the user was logged in but
+    -- the current handler logged him out, the session IDs of the
+    -- user who was logged in will not be invalidated.
+  | DoNotForceInvalidate
+    -- ^ Do not force invalidate.  Invalidate only if
+    -- automatically.  This is the default.
+    deriving (Eq, Ord, Show, Read, Enum, Typeable)
+
+
+-- | Invalidate the current session ID (and possibly more, check
+-- 'ForceInvalidate').  This is useful to avoid session fixation
+-- attacks (cf. <http://www.acrossecurity.com/papers/session_fixation.pdf>).
+--
+-- Note that the invalidate /does not/ occur when the call to
+-- this action is made!  The sessions will be invalidated on the
+-- end of the handler processing.  This means that later calls to
+-- 'forceInvalidate' on the same handler will override earlier
+-- calls.
+forceInvalidate :: MonadHandler m => ForceInvalidate -> m ()
+forceInvalidate = setSessionBS forceInvalidateKey . B8.pack . show

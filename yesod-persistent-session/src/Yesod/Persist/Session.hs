@@ -11,6 +11,8 @@ module Yesod.Persist.Session
   ( backend
   , createState
   , State
+  , forceInvalidate
+  , ForceInvalidate(..)
   ) where
 
 import Yesod.Persist.Session.Internal.Backend
